@@ -6,10 +6,19 @@ import java.net.URL
 import java.net.URLEncoder
 
 sealed class TokenResult {
-    data class Ok(val url: String, val token: String, val identity: String) : TokenResult()
-    /** Server tidak bisa mengenali pemain: minta pemain mengetik nama. */
-    data class NeedName(val message: String) : TokenResult()
+    data class Ok(val url: String, val token: String, val identity: String, val session: String) : TokenResult()
+    /** Belum ada pemain yang dikenali dari IP ini (belum /register atau belum terlihat server). */
+    data class Waiting(val message: String) : TokenResult()
+    /** Lebih dari satu pemain online di jaringan yang sama. */
+    data class Ambiguous(val message: String) : TokenResult()
     data class Error(val message: String) : TokenResult()
+}
+
+sealed class NearbyResult {
+    /** [volumes]: nama pemain (huruf kecil) -> volume 0.0..1.0. [active] false = pemain sudah keluar dari game. */
+    data class Ok(val volumes: Map<String, Double>, val active: Boolean) : NearbyResult()
+    object SessionExpired : NearbyResult()
+    object Unavailable : NearbyResult()
 }
 
 object Api {
@@ -33,19 +42,21 @@ object Api {
         }
     }
 
-    /** Minta token. Kalau [name] kosong, server mengenali pemain lewat IP. */
-    fun fetchToken(name: String?): TokenResult {
+    /** Minta token. Pemain dikenali server lewat IP (tanpa input apa pun). */
+    fun fetchToken(): TokenResult {
         return try {
-            val query = if (name.isNullOrBlank()) "" else "?name=" + URLEncoder.encode(name.trim(), "UTF-8")
-            val (code, json) = get("/voicetoken$query")
+            val (code, json) = get("/voicetoken")
             when {
                 code == 200 -> TokenResult.Ok(
                     url = json.getString("url"),
                     token = json.getString("token"),
                     identity = json.getString("identity"),
+                    session = json.getString("session"),
                 )
-                json.optBoolean("need_name", false) ->
-                    TokenResult.NeedName(json.optString("error", "Ketik playername kamu"))
+                json.optString("state") == "waiting" ->
+                    TokenResult.Waiting(json.optString("error", "Menunggu kamu masuk game"))
+                json.optString("state") == "ambiguous" ->
+                    TokenResult.Ambiguous(json.optString("error", "Ada lebih dari satu pemain di jaringan ini"))
                 else -> TokenResult.Error(json.optString("error", "Gagal (HTTP $code)"))
             }
         } catch (e: Exception) {
@@ -53,20 +64,26 @@ object Api {
         }
     }
 
-    /** Daftar pemain di sekitar: nama -> volume (0.0 sampai 1.0). null kalau gagal. */
-    fun fetchNearby(name: String): Map<String, Double>? {
+    fun fetchNearby(session: String): NearbyResult {
         return try {
-            val (code, json) = get("/nearby?name=" + URLEncoder.encode(name, "UTF-8"), timeoutMs = 4000)
-            if (code != 200) return null
-            val array = json.getJSONArray("nearby")
-            val result = HashMap<String, Double>()
-            for (i in 0 until array.length()) {
-                val item = array.getJSONObject(i)
-                result[item.getString("name")] = item.getDouble("volume")
+            val (code, json) = get("/nearby?session=" + URLEncoder.encode(session, "UTF-8"), timeoutMs = 4000)
+            when (code) {
+                200 -> {
+                    val volumes = HashMap<String, Double>()
+                    val array = json.optJSONArray("nearby")
+                    if (array != null) {
+                        for (i in 0 until array.length()) {
+                            val item = array.getJSONObject(i)
+                            volumes[item.getString("name").lowercase()] = item.getDouble("volume")
+                        }
+                    }
+                    NearbyResult.Ok(volumes, json.optBoolean("active", true))
+                }
+                401 -> NearbyResult.SessionExpired
+                else -> NearbyResult.Unavailable
             }
-            result
         } catch (e: Exception) {
-            null
+            NearbyResult.Unavailable
         }
     }
 }

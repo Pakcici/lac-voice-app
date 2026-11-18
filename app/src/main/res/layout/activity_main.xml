@@ -12,36 +12,32 @@
         android:textSize="26sp"
         android:textStyle="bold" />
 
-    <EditText
-        android:id="@+id/nameInput"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="24dp"
-        android:hint="Nama player (kosongkan untuk deteksi otomatis)"
-        android:imeOptions="actionDone"
-        android:inputType="textNoSuggestions"
-        android:maxLength="60"
-        android:singleLine="true" />
-
     <Button
         android:id="@+id/actionButton"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="Masuk" />
+        android:layout_marginTop="28dp"
+        android:text="Mulai" />
 
     <TextView
         android:id="@+id/statusText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="20dp"
-        android:text="Belum masuk."
+        android:text="Belum dimulai."
         android:textSize="16sp" />
 
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="28dp"
+        android:text="Cukup tekan Mulai sekali, lalu main LAC seperti biasa. App tersambung otomatis saat kamu masuk game dan putus otomatis saat kamu keluar. Tombol melayang: ketuk = mic nyala/mati, tekan lama = buka app ini."
+        android:textSize="13sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
         android:text="Tips: matikan penghematan baterai untuk app ini (Pengaturan, Baterai) supaya suara tetap jalan saat kamu bermain."
         android:textSize="13sp" />
 </LinearLayout>

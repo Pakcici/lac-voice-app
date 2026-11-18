@@ -17,6 +17,7 @@ import io.livekit.android.room.Room
 import io.livekit.android.room.participant.RemoteParticipant
 import io.livekit.android.room.track.RemoteAudioTrack
 import io.livekit.android.room.track.Track
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -28,48 +29,78 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Layanan latar depan: masuk room LiveKit, kirim mikrofon, dan mengatur volume tiap pemain
- * sesuai jarak (daftar dari /nearby). Berjalan terus walau game ada di depan.
+ * Layanan latar depan, otomatis tanpa input:
+ *  1. Menunggu: tiap beberapa detik bertanya ke server "pemain di IP ini sudah masuk game belum?"
+ *  2. Begitu ya: masuk room LiveKit, kirim mikrofon, atur volume tiap pemain sesuai jarak (/nearby).
+ *  3. Saat server bilang pemain sudah keluar dari game: putus, kembali menunggu.
  */
 class VoiceService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private var job: Job? = null
+    private var mainJob: Job? = null
     private var room: Room? = null
+    private var bubble: FloatingBubble? = null
 
     @Volatile
     private var volumes: Map<String, Double> = emptyMap()
-    private var finalMessage: String? = null
+
+    @Volatile
+    private var micEnabled = true
+
+    @Volatile
+    private var connected = false
+
+    @Volatile
+    private var nearbyCount = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         startForegroundCompat()   // wajib segera setelah startForegroundService
-        if (job?.isActive == true) return START_NOT_STICKY
+        if (mainJob?.isActive == true) return START_NOT_STICKY
         VoiceState.running.value = true
-        val typedName = intent?.getStringExtra(EXTRA_NAME)
-        job = scope.launch { runSession(typedName) }
+        showBubble()
+        mainJob = scope.launch { mainLoop() }
         return START_NOT_STICKY
     }
 
-    private suspend fun runSession(typedName: String?) {
-        VoiceState.status.value = "Mencari akun…"
-        when (val result = withContext(Dispatchers.IO) { Api.fetchToken(typedName) }) {
-            is TokenResult.NeedName -> finish(result.message)
-            is TokenResult.Error -> finish(result.message)
-            is TokenResult.Ok -> connectAndRun(result)
+    private suspend fun mainLoop() {
+        while (scope.isActive) {
+            val token = waitForToken() ?: return
+            runVoice(token)          // selesai kalau pemain keluar game / terputus; lalu menunggu lagi
         }
     }
 
-    private suspend fun connectAndRun(t: TokenResult.Ok) {
+    private suspend fun waitForToken(): TokenResult.Ok? {
+        setConnected(false)
+        while (scope.isActive) {
+            when (val result = withContext(Dispatchers.IO) { Api.fetchToken() }) {
+                is TokenResult.Ok -> return result
+                is TokenResult.Waiting -> VoiceState.status.value = "Menunggu kamu masuk game…"
+                is TokenResult.Ambiguous -> VoiceState.status.value = result.message
+                is TokenResult.Error -> VoiceState.status.value = result.message
+            }
+            delay(Config.WAIT_POLL_MS)
+        }
+        return null
+    }
+
+    private suspend fun runVoice(t: TokenResult.Ok) {
         val r = LiveKit.create(applicationContext)
         room = r
+        var endReason: String? = null
 
-        scope.launch {
+        val eventsJob = scope.launch {
             r.events.collect { event ->
                 when (event) {
                     is RoomEvent.TrackSubscribed -> applyVolumeTo(event.participant)
-                    is RoomEvent.Disconnected -> finish("Terputus dari server.")
+                    is RoomEvent.Disconnected -> {
+                        if (endReason == null) endReason = "Terputus dari server."
+                    }
                     else -> {}
                 }
             }
@@ -78,53 +109,131 @@ class VoiceService : Service() {
         try {
             VoiceState.status.value = "Menyambung ke room…"
             r.connect(t.url, t.token)
+            micEnabled = true
             r.localParticipant.setMicrophoneEnabled(true)
+            setConnected(true)
+            VoiceState.status.value = "Tersambung sebagai ${t.identity}. Bicara saja."
+
+            var session = t.session
+            while (scope.isActive && endReason == null) {
+                when (val res = withContext(Dispatchers.IO) { Api.fetchNearby(session) }) {
+                    is NearbyResult.Ok -> {
+                        if (!res.active) {
+                            endReason = "Kamu keluar dari game."
+                        } else {
+                            volumes = res.volumes
+                            nearbyCount = res.volumes.size
+                        }
+                    }
+                    NearbyResult.SessionExpired -> {
+                        // server dimulai ulang: minta sesi baru untuk pemain yang sama
+                        val again = withContext(Dispatchers.IO) { Api.fetchToken() }
+                        if (again is TokenResult.Ok && again.identity == t.identity) {
+                            session = again.session
+                        } else {
+                            endReason = "Sesi berakhir."
+                        }
+                    }
+                    NearbyResult.Unavailable -> {
+                        volumes = emptyMap()      // gagal -> semua diam, tidak ada suara nyasar
+                        nearbyCount = 0
+                    }
+                }
+                if (endReason == null) {
+                    for (participant in r.remoteParticipants.values) applyVolumeTo(participant)
+                    updateBubble()
+                }
+                delay(Config.POLL_MS)
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            finish("Gagal menyambung: ${e.message}")
-            return
+            endReason = "Gagal menyambung: ${e.message}"
+        } finally {
+            eventsJob.cancel()
+            volumes = emptyMap()
+            try {
+                r.disconnect()
+            } catch (e: Exception) {
+                // abaikan
+            }
+            try {
+                r.release()
+            } catch (e: Exception) {
+                // abaikan
+            }
+            room = null
+            setConnected(false)
         }
 
-        var positionOk = true
-        VoiceState.status.value = "Masuk sebagai ${t.identity}. Bicara saja."
-        while (scope.isActive) {
-            val nearby = withContext(Dispatchers.IO) { Api.fetchNearby(t.identity) }
-            volumes = nearby ?: emptyMap()     // gagal -> semua diam, tidak ada suara nyasar
-            if ((nearby != null) != positionOk) {
-                positionOk = nearby != null
-                VoiceState.status.value = if (positionOk) {
-                    "Masuk sebagai ${t.identity}. Bicara saja."
-                } else {
-                    "Masuk sebagai ${t.identity}. Posisi belum tersedia, suara pemain lain dimatikan."
-                }
-            }
-            for (participant in r.remoteParticipants.values) {
-                applyVolumeTo(participant)
-            }
-            delay(Config.POLL_MS)
-        }
+        VoiceState.status.value = endReason ?: "Selesai."
+        delay(2000)   // beri waktu pesan terbaca sebelum kembali menunggu
     }
 
     private fun applyVolumeTo(participant: RemoteParticipant) {
         val id = participant.identity?.value ?: return
-        val volume = volumes[id] ?: 0.0     // yang tidak ada di daftar = diam
+        val volume = volumes[id.lowercase()] ?: 0.0     // yang tidak ada di daftar = diam
         val track = participant.getTrackPublication(Track.Source.MICROPHONE)?.track as? RemoteAudioTrack
         track?.setVolume(volume)
     }
 
-    private fun finish(message: String) {
-        finalMessage = message
-        stopSelf()
+    // ---- tombol melayang ----
+
+    private fun showBubble() {
+        if (bubble != null) return
+        val b = FloatingBubble(this, onTap = { toggleMic() }, onLongPress = { openApp() })
+        if (b.show()) {
+            bubble = b
+            updateBubble()
+        }
+    }
+
+    private fun setConnected(value: Boolean) {
+        connected = value
+        if (!value) nearbyCount = 0
+        updateBubble()
+    }
+
+    private fun updateBubble() {
+        bubble?.update(connected, micEnabled, nearbyCount)
+    }
+
+    private fun toggleMic() {
+        val r = room ?: return
+        if (!connected) return
+        micEnabled = !micEnabled
+        updateBubble()
+        scope.launch {
+            try {
+                r.localParticipant.setMicrophoneEnabled(micEnabled)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // abaikan
+            }
+        }
+    }
+
+    private fun openApp() {
+        val intent = Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            // abaikan
+        }
     }
 
     override fun onDestroy() {
         scope.cancel()
+        bubble?.hide()
+        bubble = null
         try {
             room?.disconnect()
         } catch (e: Exception) {
             // abaikan
         }
-        room = null
-        VoiceState.status.value = finalMessage ?: "Keluar."
+        VoiceState.status.value = "Dihentikan."
         VoiceState.running.value = false
         super.onDestroy()
     }
@@ -140,18 +249,23 @@ class VoiceService : Service() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val stopIntent = PendingIntent.getService(
+            this, 1, Intent(this, VoiceService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("LAC Voice aktif")
-            .setContentText("Mikrofon dan suara proximity berjalan")
+            .setContentText("Tersambung otomatis saat kamu masuk game")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(openApp)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Berhenti", stopIntent)
             .setOngoing(true)
             .build()
         ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
     }
 
     companion object {
-        const val EXTRA_NAME = "name"
+        const val ACTION_STOP = "id.lac.voice.STOP"
         private const val CHANNEL_ID = "lac_voice"
         private const val NOTIFICATION_ID = 1
     }
